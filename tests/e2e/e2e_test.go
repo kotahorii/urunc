@@ -359,6 +359,7 @@ func TestNerdctl(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
 			nerdctlTool := newNerdctlTool(tc)
 			runTest(nerdctlTool, t)
 		})
@@ -626,6 +627,7 @@ func TestCtr(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
 			ctrTool := newCtrTool(tc)
 			runTest(ctrTool, t)
 		})
@@ -838,6 +840,7 @@ func TestCrictl(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
 			crictlTool := newCrictlTool(tc)
 			runTest(crictlTool, t)
 		})
@@ -1078,6 +1081,7 @@ func TestDocker(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
 			dockerTool := newDockerTool(tc)
 			runTest(dockerTool, t)
 		})
