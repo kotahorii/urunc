@@ -1,0 +1,220 @@
+name: custom VM spawner 
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+      runner:
+        type: string
+        default: '["base", "dind", "2204"]'
+      runner-archs:
+        type: string
+        default: '["amd64"]'
+      runner-arch-map:
+        type: string
+        default: '[{"amd64":"x86_64", "arm64":"aarch64", "arm":"armv7l"}]'
+    secrets:
+      GIT_CLONE_PAT:
+        required: false
+
+  workflow_dispatch:
+  
+jobs:
+  prepare:
+    name: VM test
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        #archconfig: ["${{ fromJSON(inputs.runner-archs) }}"]
+        test: ["test_ctr","test_nerdctl","test_crictl","test_docker"]
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+    - uses: actions/setup-go@v4
+      with:
+        go-version: '1.24.1'
+        cache: false
+
+    - name: Set ref and repo from PR or dispatch
+      id: set-ref
+      run: |
+        if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "pull_request_target" ]]; then
+          echo "ref=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
+          echo "repo=${{ github.event.pull_request.head.repo.full_name }}" >> "$GITHUB_OUTPUT"
+          echo "vmnamestr=pr${{ github.event.pull_request.number }}" >> "$GITHUB_ENV"
+        else
+          echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          echo "repo=${{ github.repository }}" >> "$GITHUB_OUTPUT"
+          echo "vmnamestr=manual" >> "$GITHUB_ENV"
+        fi
+    - name: Install base dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git wget build-essential libseccomp-dev pkg-config bc make qemu-system
+
+    - name: Install runc
+      run: |
+        RUNC_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/opencontainers/runc/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://github.com/opencontainers/runc/releases/download/v$RUNC_VERSION/runc.$(dpkg --print-architecture)
+        sudo install -m 755 runc.$(dpkg --print-architecture) /usr/local/sbin/runc
+        rm -f ./runc.$(dpkg --print-architecture)
+
+    - name: Install containerd
+      run: |
+        CONTAINERD_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/containerd/containerd/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://github.com/containerd/containerd/releases/download/v$CONTAINERD_VERSION/containerd-$CONTAINERD_VERSION-linux-$(dpkg --print-architecture).tar.gz
+        sudo tar Cxzvf /usr/local containerd-$CONTAINERD_VERSION-linux-$(dpkg --print-architecture).tar.gz
+        rm -f containerd-$CONTAINERD_VERSION-linux-$(dpkg --print-architecture).tar.gz
+
+    - name: Set up containerd service
+      run: |
+        CONTAINERD_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/containerd/containerd/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://raw.githubusercontent.com/containerd/containerd/v$CONTAINERD_VERSION/containerd.service
+        sudo rm -f /lib/systemd/system/containerd.service
+        sudo mv containerd.service /lib/systemd/system/containerd.service
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now containerd
+
+    - name: Configure containerd
+      run: |
+        sudo mkdir -p /etc/containerd/
+        sudo mv /etc/containerd/config.toml /etc/containerd/config.toml.bak || true
+        sudo containerd config default | sudo tee /etc/containerd/config.toml
+        sudo systemctl restart containerd
+
+    - name: Setup devmapper
+      run: |
+        sudo mkdir -p /usr/local/bin/scripts
+        sudo cp script/dm_create.sh /usr/local/bin/scripts/dm_create.sh
+        sudo chmod 755 /usr/local/bin/scripts/dm_create.sh
+        sudo /usr/local/bin/scripts/dm_create.sh
+        sudo sed -i "/\[plugins\.'io\.containerd\.snapshotter\.v1\.devmapper'\]/,/^$/d" /etc/containerd/config.toml
+        sudo tee -a /etc/containerd/config.toml > /dev/null <<'EOT'
+        [plugins.'io.containerd.snapshotter.v1.devmapper']
+          pool_name = "containerd-pool"
+          root_path = "/var/lib/containerd/io.containerd.snapshotter.v1.devmapper"
+          base_image_size = "10GB"
+          fs_type = "ext2"
+        EOT
+        sudo tee -a /etc/containerd/config.toml > /dev/null <<EOT
+        [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.urunc]
+            runtime_type = "io.containerd.urunc.v2"
+            container_annotations = ["com.urunc.unikernel.*"]
+            pod_annotations = ["com.urunc.unikernel.*"]
+            snapshotter = "devmapper"
+        EOT
+        sudo systemctl restart containerd
+
+
+    - name: Install CNI plugins
+      run: |
+        CNI_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/containernetworking/plugins/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://github.com/containernetworking/plugins/releases/download/v$CNI_VERSION/cni-plugins-linux-$(dpkg --print-architecture)-v$CNI_VERSION.tgz
+        sudo mkdir -p /opt/cni/bin
+        sudo tar Cxzvf /opt/cni/bin cni-plugins-linux-$(dpkg --print-architecture)-v$CNI_VERSION.tgz
+        rm -f cni-plugins-linux-$(dpkg --print-architecture)-v$CNI_VERSION.tgz
+
+    - name: Install nerdctl
+      run: |
+        NERDCTL_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/containerd/nerdctl/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://github.com/containerd/nerdctl/releases/download/v$NERDCTL_VERSION/nerdctl-$NERDCTL_VERSION-linux-$(dpkg --print-architecture).tar.gz
+        sudo tar Cxzvf /usr/local/bin nerdctl-$NERDCTL_VERSION-linux-$(dpkg --print-architecture).tar.gz
+        rm -f nerdctl-$NERDCTL_VERSION-linux-$(dpkg --print-architecture).tar.gz
+
+    - name: Install crictl
+      run: |
+        VERSION="v1.30.0" # check latest version in /releases page
+        wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-amd64.tar.gz
+        sudo tar zxvf crictl-$VERSION-linux-amd64.tar.gz -C /usr/local/bin
+        rm -f crictl-$VERSION-linux-amd64.tar.gz
+        sudo tee -a /etc/crictl.yaml > /dev/null <<'EOT'
+        runtime-endpoint: unix:///run/containerd/containerd.sock
+        image-endpoint: unix:///run/containerd/containerd.sock
+        timeout: 20
+        EOT
+
+
+    - name: Install Firecracker
+      run: |
+        ARCH="$(uname -m)"
+        VERSION="v1.7.0"
+        release_url="https://github.com/firecracker-microvm/firecracker/releases"
+        curl -L ${release_url}/download/${VERSION}/firecracker-${VERSION}-${ARCH}.tgz | tar -xz
+        # Rename the binary to "firecracker"
+        sudo mv release-${VERSION}-${ARCH}/firecracker-${VERSION}-${ARCH} /usr/local/bin/firecracker
+        rm -fr release-${VERSION}-${ARCH}
+
+    - name: Install solo5
+      run: |
+        git clone -b v0.9.0 https://github.com/Solo5/solo5.git
+        cd solo5
+        ./configure.sh  && make -j$(nproc)
+        sudo cp tenders/hvt/solo5-hvt /usr/local/bin
+        sudo cp tenders/spt/solo5-spt /usr/local/bin
+
+    - name: Add runner user to KVM group
+      id: kvm-setup
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+        sudo usermod -a -G kvm $USER
+
+    - name: Install and configure k3s with Calico and urunc
+      run: |
+        echo "Prepare VM" 
+        sudo apt-get update && apt-get install -y curl wget
+        echo "Install k3s" 
+        curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--flannel-backend=none ' sh -s - --disable-network-policy --disable servicelb --disable metrics-server --cluster-cidr 10.244.32.0/19 --service-cidr 10.244.0.0/19"
+
+        echo "Install Calico"
+        kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+
+        wget https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/custom-resources.yaml
+        wget -q https://github.com/mikefarah/yq/releases/download/v4.43.1/yq_linux_${{ matrix.archconfig }} -O /usr/bin/yq && chmod +x /usr/bin/yq
+        sed -i.bak 's|192.168.0.0/16|10.244.32.0/19|g' custom-resources.yaml
+        # Workaround to avoid docker API cap
+        #yq eval 'select(.kind == \"Installation\").spec.registry = \"harbor.nbfc.io\"' -i custom-resources.yaml
+        #yq eval 'select(.kind == \"Installation\").spec.imagePath = \"proxy_cache/calico\"' -i custom-resources.yaml
+
+        echo "Apply Calico custom resources" 
+        kubectl apply -f custom-resources.yaml
+        echo "Wait for tigera-operator pods" 
+        kubectl wait --for=condition=Ready pods --all -n tigera-operator --timeout=300s
+        echo "Wait for calico-system pods" 
+        kubectl wait --for=condition=Ready pods --all -n calico-system --timeout=300s
+        echo "Wait for calico-apiserver pods" 
+        kubectl wait --for=condition=Ready pods --all -n calico-apiserver --timeout=300s
+
+        # Install urunc
+        kubectl apply -f https://raw.githubusercontent.com/nubificus/urunc/main/deployment/urunc-deploy/urunc-rbac/urunc-rbac.yaml
+        echo "Deploy urunc" 
+        kubectl apply -k https://github.com/nubificus/urunc//deployment/urunc-deploy/urunc-deploy/overlays/k3s?ref=main
+        echo "Wait for urunc-deploy pods" 
+        kubectl -n kube-system wait --timeout=200s --for=condition=Ready -l name=urunc-deploy pod
+
+        # Check deployment
+        echo "Check pods" 
+        kubectl get pods -A -o wide
+        echo "Check nodes" 
+        kubectl get nodes --show-labels
+
+        echo "Apply urunc runtimeclass" 
+        kubectl apply -f https://raw.githubusercontent.com/nubificus/urunc/refs/heads/main/deployment/urunc-deploy/runtimeclasses/runtimeclass.yaml
+
+
+    - name: Run some tests
+      run: |
+        sleep 10
+
+    - name: Delete urunc-deploy
+      run: |
+        kubectl delete -k https://github.com/nubificus/urunc//deployment/urunc-deploy/urunc-deploy/overlays/k3s?ref=main
+        kubectl apply -f https://raw.githubusercontent.com/nubificus/urunc/main/deployment/urunc-deploy/urunc-rbac/urunc-rbac.yaml
+        sleep 10
+        kubectl get nodes --show-labels -o wide
+        kubectl get pods -A -o wide
+        kubectl get nodes -o wide --show-labels

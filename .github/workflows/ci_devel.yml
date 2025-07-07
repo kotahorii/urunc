@@ -30,3 +30,26 @@ jobs:
       skip-build: ${{ inputs.skip_build }}
       skip-lint: ${{ inputs.skip_lint }}
     secrets: inherit
+
+#  nightly:
+#    permissions:
+#      contents: read
+#      packages: write
+#      id-token: write
+#      attestations: write
+#      pull-requests: read
+#    uses: ./.github/workflows/nightly.yml
+#    with:
+#      ref: ${{ github.sha }}
+#      skip-build: ${{ inputs.skip_build }}
+#      skip-lint: ${{ inputs.skip_lint }}
+#    secrets: inherit
+  urunc-deploy:
+    name: Test urunc-deploy
+    uses: ./.github/workflows/urunc-deploy.yml
+    with:
+      ref: ${{ github.sha }}
+        #skip-build: ${{ inputs.skip_build }}
+        #skip-lint: ${{ inputs.skip_lint }}
+    secrets: inherit
+
