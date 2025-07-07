@@ -4,9 +4,39 @@ on:
   pull_request:
     branches: ["main"]
     types: [synchronize, labeled, unlabeled]
-  schedule:
-    - cron: '0 0 * * *'
+      #schedule:
+      #- cron: '0 0 * * *'
   workflow_dispatch:
+    inputs:
+      ref:
+        required: true
+        type: string
+      skip-build:
+        description: 'Skip the build job?'
+        required: false
+        default: "no"
+        type: string
+      skip-lint:
+        description: 'Skip the lint job?'
+        required: false
+        default: "no"
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      skip-build:
+        description: 'Skip the build job?'
+        required: false
+        default: "no"
+        type: string
+      skip-lint:
+        description: 'Skip the lint job?'
+        required: false
+        default: "no"
+        type: string
+
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -15,19 +45,20 @@ concurrency:
 jobs:
   urunc-deploy:
     name: Test urunc-deploy
-    if: | 
-      contains(github.event.pull_request.labels.*.name, 'ok-to-test') &&
-      !contains(github.event.pull_request.labels.*.name, 'skip-test')
     uses: ./.github/workflows/urunc-deploy.yml
+    with:
+      ref: ${{ github.sha }}
+      skip-build: ${{ inputs.skip-build }}
+      skip-lint: ${{ inputs.skip-lint }}
     secrets: inherit
 
-  knative_test:
-    needs: [urunc-deploy]
-    name: Test Knative
-    if: | 
-      contains(github.event.pull_request.labels.*.name, 'ok-to-test') &&
-      !contains(github.event.pull_request.labels.*.name, 'skip-test')
-    uses: ./.github/workflows/knative_test.yml
-    secrets: inherit
+#  knative_test:
+#    needs: [urunc-deploy]
+#    name: Test Knative
+#    if: | 
+#      contains(github.event.pull_request.labels.*.name, 'ok-to-test') &&
+#      !contains(github.event.pull_request.labels.*.name, 'skip-test')
+#    uses: ./.github/workflows/knative_test.yml
+#    secrets: inherit
 
 

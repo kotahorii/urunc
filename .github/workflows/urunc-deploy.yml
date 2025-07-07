@@ -2,6 +2,19 @@ name: Test urunc deploy
 on:
   workflow_call:
     inputs:
+      ref:
+        type: string
+        default: ''
+      skip-build:
+        description: 'Skip the build job?'
+        required: false
+        default: "no"
+        type: string
+      skip-lint:
+        description: 'Skip the lint job?'
+        required: false
+        default: "no"
+        type: string
       runner:
         type: string
         default: '["base", "dind", "2204"]'
@@ -16,120 +29,309 @@ on:
         required: false
 
   workflow_dispatch:
-  
-env:
-  SSH_USER: 'incus-ci'
-  SSH_KEY: '${{ secrets.INCUS_ID_ED25519 }}'
-  INCUS_CLUSTER: 'nbfc'
-  INCUS_PROJECT: 'nbfc-ci'
-  VM_NAME: 'test-vm'
-  INCUS_NAME: '${{ github.event.repository.name }}-${{ github.run_id }}-${{ github.run_attempt }}'
 
+  
 jobs:
   test:
     name: urunc-deploy
-    runs-on: ${{ format('{0}-{1}', join(fromJSON(inputs.runner), '-'), matrix.archconfig) }}
+    runs-on: ${{ matrix.runner}}
     strategy:
       matrix:
-        archconfig: ["${{ fromJSON(inputs.runner-archs) }}"]
+        include:
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+              #runner: oracle-4cpu-16gb-arm64
+          - arch: amd64
+            runner: ubuntu-22.04
+              #runner: oracle-vm-4cpu-16gb-x86-64
       fail-fast: false
     steps:
-    - name: Generate Names
-      id: generate-names
-      uses: boonya/gh-action-name-generator@v1
+
+    - uses: actions/checkout@v3
       with:
-        separator: '-'
-        length: 2
-        style: 'lowerCase'
+        ref: ${{ github.event.pull_request.head.sha }}
+    - uses: actions/setup-go@v4
+      with:
+        go-version: '1.24.1'
+        cache: false
 
-    - name: Set VM image
-      id: set-vm-image
+    - name: Set ref and repo from PR or dispatch
+      id: set-ref
       run: |
-        ARCHITECTURE=$(uname -m)
-        echo "Current architecture: $ARCHITECTURE"
-
-        ID=$(date +%s%N | sha256sum | head -c 12)
-        echo "UNIQ_ID=$ID" >> $GITHUB_ENV
-
-        if [[ "$ARCHITECTURE" == "x86_64" ]]; then
-          IMAGE='nbfc:f4e9e1e4859e'
-          TARGET='@amd64'
-        elif [[ "$ARCHITECTURE" == "aarch64" ]]; then
-          IMAGE='nbfc:71b1bb3aa205'
-          TARGET='@arm64'
+        if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "pull_request_target" ]]; then
+          echo "ref=${{ github.event.pull_request.head.ref }}" >> "$GITHUB_OUTPUT"
+          echo "repo=${{ github.event.pull_request.head.repo.full_name }}" >> "$GITHUB_OUTPUT"
+          echo "vmnamestr=pr${{ github.event.pull_request.number }}" >> "$GITHUB_ENV"
         else
-          echo "Unknown architecture: $ARCHITECTURE"
+          echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          echo "repo=${{ github.repository }}" >> "$GITHUB_OUTPUT"
+          echo "vmnamestr=manual" >> "$GITHUB_ENV"
         fi
-        echo "INCUS_IMAGE=${IMAGE}" >> $GITHUB_ENV
-        echo "INCUS_TARGET=${TARGET}" >> $GITHUB_ENV
-        echo "VM_NAME=${{ github.event.repository.name }}-urunc-deploy-${{ steps.generate-names.outputs.name }}" >> $GITHUB_ENV
 
-    - name: Setup Incus remote
-      uses: nubificus/incus-remote-setup-action@5580bf31df021cd6cf3266c4383a8ccb448ed7f9
-      with:
-        ssh_user: ${{ env.SSH_USER }}
-        ssh_key: ${{ secrets.INCUS_ID_ED25519 }}
-        remote_host: ${{ secrets.INCUS_IP_ADDR }}
-        friendly_name: ${{ env.INCUS_CLUSTER }}
-        incus_client_name: '${{ env.INCUS_NAME }}-${{ env.UNIQ_ID }}'
-        cleanup: false
-    
-    - name: Launch VM
-      id: launch-vm
-      uses: nubificus/incus-launch-vm-action@00e5e2f420e7377f1be706c4546aeb9365169dd7
-      with:
-        vm_name: '${{ env.VM_NAME }}'
-        vm_description: 'CI VM for ${{ github.event.repository.name }} for PR ${{ github.event.pull_request.number }} end-to-end testing'
-        incus_remote: ${{ env.INCUS_CLUSTER }}
-        incus_image: ${{ env.INCUS_IMAGE }}
-        cpu_cores: '4'
-        memory: '4' # size in GiB
-        disk_size: '20' # size in GiB
-        incus_profile: 'urunc-ci'
-        incus_project: ${{ env.INCUS_PROJECT }}
-        incus_target: ${{ env.INCUS_TARGET }}
-        cleanup: 'true'
-        snapshot: 'false'
-
-    - name: Install and configure k3s with Calico and urunc
+    - name: Install base dependencies
       run: |
-        retry() {
-          desc="$1"
-          shift
-          for i in {1..10}; do
-            echo "[$desc] Attempt $i..."
-            "$@" && break || sleep $((i * 2))
-          done
-        }
+        sudo apt-get update
+        sudo apt-get install -y git wget build-essential libseccomp-dev pkg-config bc make qemu-system
 
-        export VM_NAME="${{ env.INCUS_CLUSTER }}:${{ env.VM_NAME }}"
-        export INCUS_RUN="incus exec $VM_NAME --project ${{ env.INCUS_PROJECT }} -- sh -c "
+    - name: Install runc
+      run: |
+        RUNC_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/opencontainers/runc/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://github.com/opencontainers/runc/releases/download/v$RUNC_VERSION/runc.$(dpkg --print-architecture)
+        sudo install -m 755 runc.$(dpkg --print-architecture) /usr/local/sbin/runc
+        rm -f ./runc.$(dpkg --print-architecture)
 
-        retry "Prepare VM" $INCUS_RUN 'sudo apt-get update && apt-get install -y curl wget'
+    - name: Install containerd
+      run: |
+        CONTAINERD_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/containerd/containerd/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://github.com/containerd/containerd/releases/download/v$CONTAINERD_VERSION/containerd-$CONTAINERD_VERSION-linux-$(dpkg --print-architecture).tar.gz
+        sudo tar Cxzvf /usr/local containerd-$CONTAINERD_VERSION-linux-$(dpkg --print-architecture).tar.gz
+        rm -f containerd-$CONTAINERD_VERSION-linux-$(dpkg --print-architecture).tar.gz
 
-        retry "Install k3s" $INCUS_RUN "curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--flannel-backend=none ' sh -s - --disable-network-policy --disable servicelb --disable metrics-server --cluster-cidr 10.244.32.0/19 --service-cidr 10.244.0.0/19"
+    - name: Set up containerd service
+      run: |
+        CONTAINERD_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/containerd/containerd/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://raw.githubusercontent.com/containerd/containerd/v$CONTAINERD_VERSION/containerd.service
+        sudo rm -f /lib/systemd/system/containerd.service
+        sudo mv containerd.service /lib/systemd/system/containerd.service
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now containerd
 
-        $INCUS_RUN "kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml"
-        $INCUS_RUN "wget https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/custom-resources.yaml"
-        $INCUS_RUN "wget -q https://github.com/mikefarah/yq/releases/download/v4.43.1/yq_linux_${{ matrix.archconfig }} -O /usr/bin/yq && chmod +x /usr/bin/yq"
-        $INCUS_RUN "sed -i.bak 's|192.168.0.0/16|10.244.32.0/19|g' custom-resources.yaml"
-        $INCUS_RUN "yq eval 'select(.kind == \"Installation\").spec.registry = \"harbor.nbfc.io\"' -i custom-resources.yaml"
-        $INCUS_RUN "yq eval 'select(.kind == \"Installation\").spec.imagePath = \"proxy_cache/calico\"' -i custom-resources.yaml"
+    - name: Configure containerd
+      run: |
+        sudo mkdir -p /etc/containerd/
+        sudo mv /etc/containerd/config.toml /etc/containerd/config.toml.bak || true
+        sudo containerd config default | sudo tee /etc/containerd/config.toml
+        sudo systemctl restart containerd
 
-        retry "Apply Calico custom resources" $INCUS_RUN "kubectl apply -f custom-resources.yaml"
-        retry "Wait for tigera-operator pods" $INCUS_RUN "kubectl wait --for=condition=Ready pods --all -n tigera-operator --timeout=300s"
-        retry "Wait for calico-system pods" $INCUS_RUN "kubectl wait --for=condition=Ready pods --all -n calico-system --timeout=300s"
-        retry "Wait for calico-apiserver pods" $INCUS_RUN "kubectl wait --for=condition=Ready pods --all -n calico-apiserver --timeout=300s"
+    - name: Setup devmapper
+      run: |
+        sudo mkdir -p /usr/local/bin/scripts
+        sudo cp script/dm_create.sh /usr/local/bin/scripts/dm_create.sh
+        sudo chmod 755 /usr/local/bin/scripts/dm_create.sh
+        sudo /usr/local/bin/scripts/dm_create.sh
+        sudo sed -i "/\[plugins\.'io\.containerd\.snapshotter\.v1\.devmapper'\]/,/^$/d" /etc/containerd/config.toml
+        sudo tee -a /etc/containerd/config.toml > /dev/null <<'EOT'
+        [plugins.'io.containerd.snapshotter.v1.devmapper']
+          pool_name = "containerd-pool"
+          root_path = "/var/lib/containerd/io.containerd.snapshotter.v1.devmapper"
+          base_image_size = "10GB"
+          fs_type = "ext2"
+        EOT
+        sudo tee -a /etc/containerd/config.toml > /dev/null <<EOT
+        [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.urunc]
+            runtime_type = "io.containerd.urunc.v2"
+            container_annotations = ["com.urunc.unikernel.*"]
+            pod_annotations = ["com.urunc.unikernel.*"]
+            snapshotter = "devmapper"
+        EOT
+        sudo systemctl restart containerd
+
+
+    - name: Install CNI plugins
+      run: |
+        CNI_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/containernetworking/plugins/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://github.com/containernetworking/plugins/releases/download/v$CNI_VERSION/cni-plugins-linux-$(dpkg --print-architecture)-v$CNI_VERSION.tgz
+        sudo mkdir -p /opt/cni/bin
+        sudo tar Cxzvf /opt/cni/bin cni-plugins-linux-$(dpkg --print-architecture)-v$CNI_VERSION.tgz
+        rm -f cni-plugins-linux-$(dpkg --print-architecture)-v$CNI_VERSION.tgz
+
+    - name: Install nerdctl
+      run: |
+        NERDCTL_VERSION=$(curl -L -s -o /dev/null -w '%{url_effective}' "https://github.com/containerd/nerdctl/releases/latest" | grep -oP "v\d+\.\d+\.\d+" | sed 's/v//')
+        wget -q https://github.com/containerd/nerdctl/releases/download/v$NERDCTL_VERSION/nerdctl-$NERDCTL_VERSION-linux-$(dpkg --print-architecture).tar.gz
+        sudo tar Cxzvf /usr/local/bin nerdctl-$NERDCTL_VERSION-linux-$(dpkg --print-architecture).tar.gz
+        rm -f nerdctl-$NERDCTL_VERSION-linux-$(dpkg --print-architecture).tar.gz
+
+    - name: Install crictl
+      run: |
+        VERSION="v1.30.0" # check latest version in /releases page
+        wget https://github.com/kubernetes-sigs/cri-tools/releases/download/$VERSION/crictl-$VERSION-linux-amd64.tar.gz
+        sudo tar zxvf crictl-$VERSION-linux-amd64.tar.gz -C /usr/local/bin
+        rm -f crictl-$VERSION-linux-amd64.tar.gz
+        sudo tee -a /etc/crictl.yaml > /dev/null <<'EOT'
+        runtime-endpoint: unix:///run/containerd/containerd.sock
+        image-endpoint: unix:///run/containerd/containerd.sock
+        timeout: 20
+        EOT
+
+
+    - name: Install Firecracker
+      run: |
+        ARCH="$(uname -m)"
+        VERSION="v1.7.0"
+        release_url="https://github.com/firecracker-microvm/firecracker/releases"
+        curl -L ${release_url}/download/${VERSION}/firecracker-${VERSION}-${ARCH}.tgz | tar -xz
+        # Rename the binary to "firecracker"
+        sudo mv release-${VERSION}-${ARCH}/firecracker-${VERSION}-${ARCH} /usr/local/bin/firecracker
+        rm -fr release-${VERSION}-${ARCH}
+
+    - name: Install solo5
+      run: |
+        git clone -b v0.9.0 https://github.com/Solo5/solo5.git
+        cd solo5
+        ./configure.sh  && make -j$(nproc)
+        sudo cp tenders/hvt/solo5-hvt /usr/local/bin
+        sudo cp tenders/spt/solo5-spt /usr/local/bin
+
+    - name: Add runner user to KVM group
+      if: matrix.arch != 'arm64'
+      id: kvm-setup
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+        sudo usermod -a -G kvm $USER
+
+    - name: Install k3s with Calico
+      run: |
+        source $GITHUB_WORKSPACE/.github/scripts/retry.sh
+        echo "Install dependencies"
+        sudo apt-get update && sudo apt-get install -y curl wget
+    
+        echo "Install K3s without flannel"
+        curl -sfL https://get.k3s.io | sudo INSTALL_K3S_EXEC='--flannel-backend=none --disable-network-policy --disable servicelb --disable metrics-server --cluster-cidr 10.244.32.0/19 --service-cidr 10.244.0.0/19' sh -s -
+    
+        echo "Wait for K3s to generate kubeconfig..."
+        for i in {1..30}; do
+          if [ -f /etc/rancher/k3s/k3s.yaml ]; then
+            echo "k3s.yaml found"
+            break
+          fi
+          sleep 2
+        done
+    
+        if [ ! -f /etc/rancher/k3s/k3s.yaml ]; then
+          echo "Timed out waiting for kubeconfig"
+          journalctl -u k3s --no-pager
+          exit 1
+        fi
+    
+        mkdir -p ~/.kube
+        sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+        sudo chown $USER:$USER ~/.kube/config
+    
+        # Optionally replace server IP (K3s uses 127.0.0.1 by default, not accessible from other contexts)
+        sed -i "s/127.0.0.1/localhost/" ~/.kube/config
+
+        export KUBECONFIG=$HOME/.kube/config
+
+
+        echo "Install Calico"
+        retry kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+
+        wget https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/custom-resources.yaml
+        sudo wget -q https://github.com/mikefarah/yq/releases/download/v4.43.1/yq_linux_${{ matrix.archconfig }} -O /usr/bin/yq && sudo chmod +x /usr/bin/yq
+        sudo sed -i.bak 's|192.168.0.0/16|10.244.32.0/19|g' custom-resources.yaml
+        # Workaround to avoid docker API cap
+        #yq eval 'select(.kind == \"Installation\").spec.registry = \"harbor.nbfc.io\"' -i custom-resources.yaml
+        #yq eval 'select(.kind == \"Installation\").spec.imagePath = \"proxy_cache/calico\"' -i custom-resources.yaml
+
+        echo "Wait for pod(s) in tigera-operator ns to appear"
+        for i in {1..15}; do
+          TIGERA_PODS=$(kubectl get pods -n tigera-operator --no-headers 2>/dev/null | wc -l)
+          if [ "$TIGERA_PODS" -gt 0 ]; then
+            echo "Found $TIGERA_PODS pod(s) in calico-system"
+            break
+          fi
+          echo "Waiting for tigera pod(s) to be created..."
+          sleep 5
+        done
+        echo "Wait for tigera-operator pods" 
+        retry kubectl wait --for=condition=Ready pods --all -n tigera-operator --timeout=300s || true
+        retry kubectl get pods -A -o wide
+        retry kubectl wait --for=condition=Ready pods --all -n tigera-operator --timeout=300s || true
+
+        echo "Apply Calico custom resources" 
+        retry kubectl apply -f custom-resources.yaml
+
+        echo "Wait for calico-system namespace to exist"
+        for i in {1..30}; do
+          if retry kubectl get ns calico-system &>/dev/null; then
+            echo "calico-system namespace is present"
+            break
+          fi
+          echo "Waiting for calico-system namespace..."
+          sleep 5
+        done
+    
+        echo "Wait for pods in calico-system to appear"
+        for i in {1..30}; do
+          CALICO_PODS=$(kubectl get pods -n calico-system --no-headers 2>/dev/null | wc -l)
+          if [ "$CALICO_PODS" -gt 0 ]; then
+            echo "Found $CALICO_PODS pods in calico-system"
+            break
+          fi
+          echo "Waiting for calico pods to be created..."
+          sleep 5
+        done
+    
+        echo "Wait for calico-system pods to be ready"
+        retry kubectl wait --for=condition=Ready pods --all -n calico-system --timeout=200s || true
+        retry kubectl get pods -A -o wide
+        retry kubectl wait --for=condition=Ready pods --all -n calico-system --timeout=200s || true
+    
+        echo "Wait for calico-apiserver pods"
+        retry kubectl wait --for=condition=Ready pods --all -n calico-apiserver --timeout=200s || true
+        retry kubectl get pods -A -o wide
+        retry kubectl wait --for=condition=Ready pods --all -n calico-apiserver --timeout=200s || true
+        retry kubectl get pods -A -o wide
 
         # Install urunc
-        $INCUS_RUN "kubectl apply -f https://raw.githubusercontent.com/nubificus/urunc/main/deployment/urunc-deploy/urunc-rbac/urunc-rbac.yaml"
-        retry "Deploy urunc" $INCUS_RUN "kubectl apply -k https://github.com/nubificus/urunc//deployment/urunc-deploy/urunc-deploy/overlays/k3s?ref=main"
-        retry "Wait for urunc-deploy pods" $INCUS_RUN "kubectl -n kube-system wait --timeout=200s --for=condition=Ready -l name=urunc-deploy pod"
+        retry kubectl apply -f https://raw.githubusercontent.com/nubificus/urunc/main/deployment/urunc-deploy/urunc-rbac/urunc-rbac.yaml
+        echo "Deploy urunc" 
+        retry kubectl apply -k https://github.com/nubificus/urunc//deployment/urunc-deploy/urunc-deploy/overlays/k3s?ref=main
+        echo "Wait for urunc-deploy pods" 
+        retry kubectl -n kube-system wait --timeout=200s --for=condition=Ready -l name=urunc-deploy pod
 
         # Check deployment
-        retry "Check pods" $INCUS_RUN "kubectl get pods -A -o wide"
-        retry "Check nodes" $INCUS_RUN "kubectl get nodes --show-labels"
+        echo "Check pods" 
+        retry kubectl get pods -A -o wide
+        echo "Check nodes" 
+        retry kubectl get nodes --show-labels
 
-        retry "Apply urunc runtimeclass" $INCUS_RUN "kubectl apply -f https://raw.githubusercontent.com/nubificus/urunc/refs/heads/main/deployment/urunc-deploy/runtimeclasses/runtimeclass.yaml"
+        echo "Apply urunc runtimeclass" 
+        retry kubectl apply -f https://raw.githubusercontent.com/nubificus/urunc/refs/heads/main/deployment/urunc-deploy/runtimeclasses/runtimeclass.yaml
 
 
+    - name: Run some tests
+      run: |
+        export KUBECONFIG=$HOME/.kube/config
+        source $GITHUB_WORKSPACE/.github/scripts/retry.sh
+        retry kubectl get pods -A -o wide
+
+    - name: Delete urunc-deploy
+      run: |
+        export KUBECONFIG=$HOME/.kube/config
+        source $GITHUB_WORKSPACE/.github/scripts/retry.sh
+        retry kubectl delete -k https://github.com/nubificus/urunc//deployment/urunc-deploy/urunc-deploy/overlays/k3s?ref=main
+        for i in {1..35}; do
+          DEPLOY_PODS=$(kubectl get pods -n kube-system --no-headers 2>/dev/null | grep urunc-deploy | wc -l)
+          if [ "$DEPLOY_PODS" -gt 0 ]; then
+            echo "Found $DEPLOY_PODS urunc-deploy pods in kube-system"
+            break
+          fi
+          retry kubectl get pods -n kube-system --no-headers -o wide |grep urunc-deploy
+          echo "Waiting for urunc deploy pods to be deleted..."
+          sleep 5
+        done
+
+        retry kubectl apply -k https://github.com/nubificus/urunc//deployment/urunc-deploy/urunc-cleanup/overlays/k3s?ref=main
+        for i in {1..45}; do
+          DEPLOY_PODS=$(kubectl get pods -n kube-system --no-headers 2>/dev/null | grep urunc | wc -l)
+          if [ "$DEPLOY_PODS" -gt 0 ]; then
+            echo "Found $DEPLOY_PODS urunc pods in kube-system"
+            break
+          fi
+          retry kubectl get pods -n kube-system --no-headers -o wide |grep urunc
+          echo "Waiting for urunc cleanup pods to execute..."
+          sleep 5
+        done
+
+        retry kubectl delete -k https://github.com/nubificus/urunc//deployment/urunc-deploy/urunc-cleanup/overlays/k3s?ref=main
+        retry kubectl delete -f https://raw.githubusercontent.com/nubificus/urunc/main/deployment/urunc-deploy/urunc-rbac/urunc-rbac.yaml
+        retry kubectl delete -f https://raw.githubusercontent.com/nubificus/urunc/refs/heads/main/deployment/urunc-deploy/runtimeclasses/runtimeclass.yaml
+
+        sleep 10
+        retry kubectl get nodes --show-labels -o wide
+        retry kubectl get pods -A -o wide
+        retry kubectl get nodes -o wide --show-labels
