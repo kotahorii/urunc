@@ -62,8 +62,6 @@ spec:
       - image: harbor.nbfc.io/nubificus/urunc/nginx-firecracker-unikraft-initrd:latest
         imagePullPolicy: Always
         name: nginx-urunc
-        command: ["sleep"]
-        args: ["infinity"]
         ports:
         - containerPort: 80
           protocol: TCP
